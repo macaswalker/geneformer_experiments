@@ -1,0 +1,5 @@
+# Ignore loom file
+RCC_data.loom
+
+# Ignore entire geneformer-main folder
+geneformer-main/
