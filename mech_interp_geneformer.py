@@ -19,10 +19,22 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 with open("fine_tuned_model/config.json") as f:
     config_dict = json.load(f)
 
+# Remove existing 'device' key if it exists
+config_dict.pop('device', None)
+config_dict.pop('input_size', None)
+config_dict.pop('special_token', None)
+config_dict.pop('embsize', None)
+
+# Now safely add 'device=device'
+config = GeneformerConfig(**config_dict, device=device)
+
+
 config = GeneformerConfig(**config_dict, device=device)
 model = GeneformerFineTuningModel(config, fine_tuning_head="classification", output_size=2)
 model.load_state_dict(torch.load("fine_tuned_model/pytorch_model.bin", map_location=device))
-model.to(device).eval()
+
+# Use underlying model for inference
+model.model.to(device).eval()
 
 print("✅ Model loaded successfully.")
 
@@ -43,21 +55,108 @@ print("✅ Data loaded and processed.")
 dataset = model.process_data(adata, gene_names="ensembl_id").add_column("label", labels)
 print("✅ Data tokenized successfully.")
 
-# === Step 4: Attention-based gene importance ===
-print("⏳ Extracting attention weights...")
-attention_weights = model.get_attention_weights(dataset)
-avg_attention = attention_weights.mean(axis=(0, 1, 2))  # average over all cells and heads
+# === Step 4: Attention-based gene importance (no separate gene2idx) ===
 
-# Get gene IDs and sort by attention
-gene_ids = adata.var_names.tolist()
-attention_df = pd.DataFrame({
-    "ensembl_id": gene_ids,
-    "attention": avg_attention
-}).sort_values(by="attention", ascending=False)
+import torch
+import pandas as pd
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from collections import defaultdict
+
+print("⏳ Extracting attention weights with batch-wise approach (using adata.var_names)...")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.model.eval().to(device)
+
+###############################################################################
+# 4.1) Make a list of your Ensembl IDs from the AnnData object
+###############################################################################
+gene_ids = list(adata.var_names)  
+# We'll assume gene_ids[0] corresponds to token index 0, gene_ids[1] -> token 1, etc.
+
+###############################################################################
+# 4.2) Define a collate_fn to pad within each batch
+###############################################################################
+def collate_fn(batch):
+    """
+    Each 'example' in 'batch' is a dict from the Geneformer dataset,
+    with example["input_ids"] = [0,1,2,...,N-1] (for N genes).
+    We pad them so that within a batch, all samples match the longest length.
+    """
+    input_ids_list = [torch.tensor(example["input_ids"]) for example in batch]
+    labels = [example["label"] for example in batch]
+
+    input_ids_padded = pad_sequence(
+        input_ids_list, batch_first=True, padding_value=0
+    )
+
+    return {
+        "input_ids": input_ids_padded,
+        "labels": torch.tensor(labels)
+    }
+
+###############################################################################
+# 4.3) Create the DataLoader with a small batch_size if you get OOM
+###############################################################################
+dataloader = DataLoader(
+    dataset, 
+    batch_size=2,  # reduce to 1 if you still run out of GPU memory
+    shuffle=False, 
+    collate_fn=collate_fn
+)
+
+###############################################################################
+# 4.4) Accumulate the per-gene "attention received" across all cells
+###############################################################################
+gene_attention_sums = defaultdict(float)
+gene_counts = defaultdict(int)
+
+with torch.no_grad():
+    for batch_data in dataloader:
+        input_ids = batch_data["input_ids"].to(device)
+        # output_attentions=True -> returns attention matrices
+        outputs = model.model(input_ids=input_ids, output_attentions=True)
+        
+        # outputs.attentions is a tuple of length = num_layers
+        # each element has shape [batch_size, num_heads, seq_len, seq_len]
+        attn_tensor = torch.stack(outputs.attentions, dim=0)
+        # shape: [num_layers, batch_size, num_heads, seq_len, seq_len]
+
+        # Average across layers and heads => shape [batch_size, seq_len, seq_len]
+        attn_avg = attn_tensor.mean(dim=(0, 2))
+
+        # Loop over each sample in the batch
+        for i in range(attn_avg.size(0)):  # batch_size
+            single_attn_matrix = attn_avg[i]  # shape: [seq_len, seq_len]
+
+            # Identify valid positions (ignore padded zeros)
+            valid_positions = (input_ids[i] != 0).nonzero(as_tuple=True)[0]
+
+            for pos in valid_positions:
+                # 'pos' is the same index as in gene_ids[pos]
+                ensembl_id = gene_ids[pos]
+
+                # "Attention received" by this gene => sum over the column
+                received_attn = single_attn_matrix[:, pos].sum().item()
+
+                gene_attention_sums[ensembl_id] += received_attn
+                gene_counts[ensembl_id] += 1
+
+###############################################################################
+# 4.5) Build a DataFrame of average attention per gene
+###############################################################################
+scores = []
+for gene, total_attn in gene_attention_sums.items():
+    avg_attn = total_attn / gene_counts[gene]
+    scores.append((gene, avg_attn))
+
+attention_df = pd.DataFrame(scores, columns=["ensembl_id", "attention_score"])
+attention_df.sort_values("attention_score", ascending=False, inplace=True)
 
 top_genes_attention = attention_df.head(20)
-print("✅ Top 20 genes based on attention:")
+print("✅ Top 20 genes based on aggregated attention:")
 print(top_genes_attention)
+
 
 # === Step 5: Perturbation-based gene importance ===
 def perturb_and_measure_importance(model, dataset, gene_idx):
@@ -65,10 +164,21 @@ def perturb_and_measure_importance(model, dataset, gene_idx):
     for i in range(len(perturbed_dataset)):
         if gene_idx in perturbed_dataset[i]["input_ids"]:
             perturbed_dataset[i]["input_ids"].remove(gene_idx)
-    
-    original_outputs = model.get_outputs(dataset).softmax(axis=1)
-    perturbed_outputs = model.get_outputs(perturbed_dataset).softmax(axis=1)
-    diff = np.abs(original_outputs - perturbed_outputs).mean()
+
+    # model.get_outputs(...) => returns a NumPy array
+    original_outputs_np = model.get_outputs(dataset)
+    perturbed_outputs_np = model.get_outputs(perturbed_dataset)
+
+    # Convert to torch tensors
+    original_outputs_t = torch.from_numpy(original_outputs_np)
+    perturbed_outputs_t = torch.from_numpy(perturbed_outputs_np)
+
+    # Then apply PyTorch softmax
+    original_probs = torch.softmax(original_outputs_t, dim=1)
+    perturbed_probs = torch.softmax(perturbed_outputs_t, dim=1)
+
+    # Compute absolute difference and mean over all samples
+    diff = (original_probs - perturbed_probs).abs().mean().item()
     return diff
 
 print("⏳ Computing perturbation-based importance...")
